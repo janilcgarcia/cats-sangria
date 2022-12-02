@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Hello GraphQL</title>
+
+        <style>
+            body {
+                height: 100%;
+                margin: 0;
+                width: 100%;
+                overflow: hidden;
+            }
+
+            #graphiql {
+                height: 100vh;
+            }
+        </style>
+
+        <link href="https://unpkg.com/graphiql/graphiql.min.css" rel="stylesheet" />
+    </head>
+
+    <body>
+        <div id="graphiql"></div>
+
+        <script
+                src="https://unpkg.com/react@17/umd/react.development.js"
+                integrity="sha512-Vf2xGDzpqUOEIKO+X2rgTLWPY+65++WPwCHkX2nFMu9IcstumPsf/uKKRd5prX3wOu8Q0GBylRpsDB26R6ExOg=="
+                crossorigin="anonymous"
+        ></script>
+        <script
+                src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"
+                integrity="sha512-Wr9OKCTtq1anK0hq5bY3X/AvDI5EflDSAh0mE9gma+4hl+kXdTJPKZ3TwLMBcrgUeoY0s3dq9JjhCQc7vddtFg=="
+                crossorigin="anonymous"
+        ></script>
+        <script src="https://unpkg.com/rxjs@^7/dist/bundles/rxjs.umd.min.js" crossorigin="anonymous"></script>
+        <script crossorigin="anonymous" src="https://unpkg.com/graphiql/graphiql.min.js"></script>
+
+        <script>
+            window.SubscriptionFetchClient = (function () {
+                return class SubscriptionFetchClient {
+                    constructor() {
+                        this.connections = []
+
+                        this.events = new rxjs.Subject()
+                    }
+
+                    dispose() {
+                        this.terminate()
+
+                        this.events.complete()
+                    }
+
+                    on(event, listener) {
+                        this.events.filter(e => e.type === event).subscribe({
+                            next: (e) => {
+                                listener(e.data)
+                            }
+                        })
+                    }
+
+                    subscribe(payload, sink) {
+                        const controller = new AbortController()
+
+                        fetch('/graphql', {
+                            method: 'POST',
+                            body: JSON.stringify(payload),
+                            signal: controller.signal
+                        }).then(
+                            response => {
+                                this.connections.push({
+                                    response: response,
+                                    controller: controller
+                                })
+
+                                if (response.status < 200 || response.status > 399)
+                                    sink.error(new Error("Network error: " + response.text()))
+                                else {
+                                    const re = /\n|\r|\n\r/
+
+                                    const accFunc = ({ decoder, text }, buffer) => {
+                                        const text1 = text + decoder.decode(buffer)
+
+                                        const parts = text1.split(re)
+
+                                        return {
+                                            decoder,
+                                            text: parts[parts.length - 1],
+                                            emit: parts.slice(0, parts.length - 1)
+                                        }
+                                    }
+
+                                    rxjs.from(response.body)
+                                        .pipe(
+                                            rxjs.scan(accFunc, {
+                                                decoder: new TextDecoder('utf-8'),
+                                                text: '',
+                                                emit: []
+                                            }),
+                                            rxjs.mergeMap(({ emit }) =>
+                                                rxjs.of(emit)
+                                            ),
+                                            rxjs.map(JSON.parse)
+                                        )
+                                        .subscribe({
+                                            next(data) {
+                                                sink.next(data)
+                                            },
+
+                                            complete() {
+                                                sink.complete()
+                                            },
+
+                                            error(error) {
+                                                sink.error(error)
+                                            }
+                                        })
+                                }
+                            },
+
+                            error => {
+                                sink.error(error)
+                            }
+                        )
+
+                        return () => {}
+                    }
+
+                    terminate() {
+                        this.connections.forEach(conn => {
+                            conn.controller.abort()
+                        })
+
+                        this.connections = []
+                    }
+
+                    async _readResponse(response, sink) {
+                        // most of the code from: https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#processing_a_text_file_line_by_line
+                        const utf8Decoder = new TextDecoder('utf-8')
+                        const reader = response.body.getReader()
+
+                        let { value: chunk, done: readerDone } = await reader.read()
+                        chunk = chunk ? utf8Decoder.decode(chunk) : ''
+
+                        const re = /\n|\r|\n\r/gm
+                        let startIndex = 0
+                        let result
+
+                        while (true) {
+                            result = re.exec(chunk)
+                            if (!result) {
+                                if (readerDone) {
+                                    sink.next(JSON.parse(chunk))
+                                    break
+                                }
+                                let remainder = chunk.substring(startIndex)
+                                ({value: chunk, done: readerDone } = await reader.read())
+                                chunk = remainder + (chunk ? utf8Decoder.decode(chunk) : '')
+                                startIndex = re.lastIndex = 0
+                                continue
+                            }
+                            sink.next(JSON.parse(chunk.substring(startIndex, result.index)))
+                            startIndex = re.lastIndex
+                        }
+
+                        sink.complete()
+                    }
+                }
+            })();
+        </script>
+
+        <script>
+            ReactDOM.render(
+                React.createElement(GraphiQL, {
+                    fetcher: GraphiQL.createFetcher({
+                        url: '/graphql',
+                        wsClient: new SubscriptionFetchClient()
+                    }),
+                    defaultEditorToolsVisibility: true,
+                }),
+                document.getElementById("graphiql")
+            )
+        </script>
+    </body>
+</html>

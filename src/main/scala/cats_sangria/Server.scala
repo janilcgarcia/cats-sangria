@@ -5,9 +5,9 @@ import cats.effect.kernel.Resource.ExitCase
 import scala.util.{Failure, Success, Try}
 import cats.syntax.all.*
 import cats.effect.std.Dispatcher
-import cats.effect.{IO, IOApp, Resource}
+import cats.effect.{IO, IOApp, Resource, Temporal}
 import cats_sangria.fs2sangria.Fs2StreamSubscriptionStream
-import org.http4s.{HttpRoutes, StaticFile}
+import org.http4s.{HttpRoutes, HttpVersion, Response, StaticFile}
 import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.dsl.io.*
 import org.http4s.circe.*
@@ -24,10 +24,15 @@ import sangria.streaming.SubscriptionStream
 import scala.concurrent.{ExecutionContext, Future}
 import fs2.Stream
 import fs2.concurrent.Topic
+import fs2.io.net.Network
+import fs2.io.net.tls.TLSContext
 import org.http4s.server.websocket.WebSocketBuilder
 import org.http4s.websocket.WebSocketFrame
 import sangria.ast.OperationType
 import org.http4s.circe.CirceEntityCodec.given
+import org.http4s.server.middleware.HSTS
+import org.typelevel.log4cats.Logger
+import org.typelevel.log4cats.slf4j.*
 
 
 object Server extends IOApp.Simple:
@@ -63,18 +68,23 @@ object Server extends IOApp.Simple:
                 )
 
               if isSubscription then
-                import ExecutionScheme.Stream
+                import ExecutionScheme.Stream as StreamExecutionScheme
                 given SubscriptionStream[Stream[IO, *]] = sub
 
                 val stream: Stream[IO, Json] = execute()
 
                 Ok(stream.handleErrorWith { error =>
                   Stream.emit(Map(
-                    "errors" -> List(error.getMessage)
+                    "errors" -> Seq(error.getMessage)
                   ).asJson)
                 }.map(_.noSpaces + "\n").through(fs2.text.utf8.encodeC))
               else
-                IO.fromFuture(IO(execute())).flatMap(Ok(_))
+                IO.fromFuture(IO(execute())).attempt.flatMap {
+                  case Right(result) =>
+                    val s: String = result.noSpaces
+                    Ok(s).map(_.withHttpVersion(HttpVersion.`HTTP/2`))
+                  case Left(error) => IO(error.printStackTrace()).flatMap(_ => InternalServerError(error.getMessage))
+                }
 
             case Failure(ex) =>
               InternalServerError(ex.getMessage)
@@ -83,20 +93,52 @@ object Server extends IOApp.Simple:
       } yield response
   }
 
-  private def buildServer(schema: Schema[IO], sub: SubscriptionStream[Stream[IO, *]], dispatcher: Dispatcher[IO]) =
-    EmberServerBuilder
+  private def buildServer(schema: Schema[IO], sub: SubscriptionStream[Stream[IO, *]], dispatcher: Dispatcher[IO], tlsContext: TLSContext[IO], logger: Logger[IO]) =
+    val server = EmberServerBuilder
       .default[IO]
-      .withHttpApp(service(schema, sub, dispatcher).orNotFound)
+      .withHttp2
+      .withHttpApp(org.http4s.server.middleware.Logger.httpApp(true, true)(
+        service(schema, sub, dispatcher).orNotFound))
       .withPort(port"5000")
       .withShutdownTimeout(100.millis)
-      .withHttp2
-      .build
+      .withTLS(tlsContext)
+      .withLogger(logger)
+      .withoutUnixSocketConfig
+      .withOnWriteFailure { (req, resp, error) =>
+        for {
+          _ <- logger.error(req.toString)
+          _ <- logger.error(resp.toString)
+          _ <- logger.error(error)("Error")
+        } yield ()
+      }
+      .withErrorHandler { case error =>
+        IO
+          .println(s"Unexpected error:$error")
+          .as(Response(status = org.http4s.Status.InternalServerError))
+      }
+
+    for {
+      _ <- Resource.eval(List(
+        logger.info(show"idleTimeout: ${server.idleTimeout}"),
+        logger.info(show"receiveBufferSize: ${server.receiveBufferSize}"),
+        logger.info(show"maxConnections: ${server.maxConnections}"),
+        logger.info(show"requestHeaderReceiveTimeout: ${server.requestHeaderReceiveTimeout}")
+      ).sequence)
+      s <- server.build
+    } yield s
 
   override val run: IO[Unit] =
     (for {
+      logger <- Resource.eval(Slf4jFactory[IO].fromName("cats_sangria.Server"))
+      _ <- Resource.eval(logger.info("Cool"))
       dispatcher <- Dispatcher.parallel[IO]
       messageTopic <- Resource.eval(Topic[IO, String])
       sub = new Fs2StreamSubscriptionStream[IO](dispatcher)
       schema = Schema(messageTopic, sub)
-      _ <- buildServer(schema, sub, dispatcher)
+      tlsContext <- Resource.eval(
+        Network[IO]
+          .tlsContext
+          .fromKeyStoreResource("keystore.pkcs12", "123456".toCharArray, "123456".toCharArray)
+      )
+      _ <- buildServer(schema, sub, dispatcher, tlsContext, logger)
     } yield ()).useForever

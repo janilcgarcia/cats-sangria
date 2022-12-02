@@ -8,7 +8,7 @@ lazy val root = (project in file("."))
   .settings(
     name := "cats-sangria",
     libraryDependencies ++= Seq(
-      "org.typelevel" %% "cats-effect" % "3.4.1",
+      "org.typelevel" %% "cats-effect" % "3.4.2",
       "org.http4s" %% "http4s-dsl" % http4sVersion,
       "org.http4s" %% "http4s-ember-server" % http4sVersion,
       "org.http4s" %% "http4s-circe" % http4sVersion,
@@ -17,7 +17,8 @@ lazy val root = (project in file("."))
       "org.sangria-graphql" %% "sangria-circe" % "1.3.2",
       "io.circe" %% "circe-core" % "0.14.3",
       "io.circe" %% "circe-parser" % "0.14.3",
-      "io.circe" %% "circe-generic" % "0.14.3"
+      "io.circe" %% "circe-generic" % "0.14.3",
+      "org.typelevel" %% "log4cats-slf4j" % "2.5.0"
     ),
 
     scalacOptions += "-source:future",
